@@ -1,199 +1,131 @@
 package inventory
 
 import (
+	"errors"
 	"sync"
-	"sync/atomic"
-	"testing"
 )
 
-func TestGetStock_Basic(t *testing.T) {
-	s := NewSafeInventoryService()
-	s.AddProduct(&Product{ID: "p1", Name: "Widget", Stock: 50})
+var (
+	// ErrProductNotFound is returned when the requested product does not
+	// exist in the inventory.
+	ErrProductNotFound = errors.New("product not found")
 
-	if got := s.GetStock("p1"); got != 50 {
-		t.Fatalf("expected 50, got %d", got)
-	}
-	if got := s.GetStock("missing"); got != 0 {
-		t.Fatalf("expected 0 for missing product, got %d", got)
-	}
+	// ErrInsufficientStock is returned when there is not enough stock to
+	// satisfy a reservation.
+	ErrInsufficientStock = errors.New("insufficient stock")
+)
+
+// Product represents a single stock-keeping unit.
+type Product struct {
+	ID    string
+	Name  string
+	Stock int
 }
 
-func TestReserve_Basic(t *testing.T) {
-	s := NewSafeInventoryService()
-	s.AddProduct(&Product{ID: "p1", Stock: 10})
-
-	if err := s.Reserve("p1", 4); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got := s.GetStock("p1"); got != 6 {
-		t.Fatalf("expected 6, got %d", got)
-	}
-
-	if err := s.Reserve("p1", 100); err != ErrInsufficientStock {
-		t.Fatalf("expected ErrInsufficientStock, got %v", err)
-	}
-
-	if err := s.Reserve("unknown", 1); err != ErrProductNotFound {
-		t.Fatalf("expected ErrProductNotFound, got %v", err)
-	}
+// ReserveItem describes one line item of a multi-product reservation
+// request.
+type ReserveItem struct {
+	ProductID string
+	Quantity  int
 }
 
-// TestReserve_ConcurrentOversell is the core regression test for race
-// condition #2 in REVIEW.md. Stock starts at 100 and 200 goroutines each
-// try to reserve exactly 1 unit concurrently.
+// SafeInventoryService is a thread-safe inventory manager.
 //
-// With a broken (check-then-act, or unlocked) implementation, more than 100
-// reservations can succeed - an oversell. With correct atomic
-// check-and-reserve under a single write lock, exactly 100 succeed and 100
-// fail, every single time this test runs.
+// It uses a single sync.RWMutex to protect the products map and the Stock
+// field of every Product it contains. Reads (GetStock) take an RLock, so
+// any number of readers can proceed concurrently. Writes (Reserve,
+// ReserveMultiple, AddProduct) take a full Lock, giving them exclusive
+// access.
 //
-// Run with: go test -race -run TestReserve_ConcurrentOversell -count=20
-func TestReserve_ConcurrentOversell(t *testing.T) {
-	s := NewSafeInventoryService()
-	s.AddProduct(&Product{ID: "p1", Stock: 100})
+// Deliberately NOT used here: per-product (fine-grained) locking. It looks
+// tempting for throughput, but ReserveMultiple needs to check and mutate
+// several products as a single atomic unit, and per-product locks reintroduce
+// the classic lock-ordering deadlock (see ANSWERS.md, Q2). A single
+// coarse-grained lock keeps the invariants easy to reason about; if this
+// service becomes a real bottleneck, sharding by product ID (with a fixed,
+// deterministic shard order) is the next step, not naive per-product locks.
+type SafeInventoryService struct {
+	mu       sync.RWMutex
+	products map[string]*Product
+}
 
-	const goroutines = 200
-	var wg sync.WaitGroup
-	var successCount int64
-	var failCount int64
-
-	wg.Add(goroutines)
-	for i := 0; i < goroutines; i++ {
-		go func() {
-			defer wg.Done()
-			if err := s.Reserve("p1", 1); err == nil {
-				atomic.AddInt64(&successCount, 1)
-			} else {
-				atomic.AddInt64(&failCount, 1)
-			}
-		}()
-	}
-	wg.Wait()
-
-	if successCount != 100 {
-		t.Errorf("expected exactly 100 successful reservations, got %d", successCount)
-	}
-	if failCount != 100 {
-		t.Errorf("expected exactly 100 failed reservations, got %d", failCount)
-	}
-	if finalStock := s.GetStock("p1"); finalStock != 0 {
-		t.Errorf("expected final stock 0, got %d (evidence of oversell/lost update)", finalStock)
+// NewSafeInventoryService creates an empty, ready-to-use service.
+func NewSafeInventoryService() *SafeInventoryService {
+	return &SafeInventoryService{
+		products: make(map[string]*Product),
 	}
 }
 
-// TestReserveMultiple_Atomicity verifies the all-or-nothing contract for
-// race condition #3: a batch that partially fails must leave every product
-// in the batch completely unchanged.
-func TestReserveMultiple_Atomicity(t *testing.T) {
-	s := NewSafeInventoryService()
-	s.AddProduct(&Product{ID: "A", Stock: 10})
-	s.AddProduct(&Product{ID: "B", Stock: 5})
-
-	// B only has 5 units, so this batch must fail entirely.
-	err := s.ReserveMultiple([]ReserveItem{
-		{ProductID: "A", Quantity: 8},
-		{ProductID: "B", Quantity: 8},
-	})
-	if err != ErrInsufficientStock {
-		t.Fatalf("expected ErrInsufficientStock, got %v", err)
-	}
-
-	if got := s.GetStock("A"); got != 10 {
-		t.Errorf("expected product A to remain unchanged at 10, got %d", got)
-	}
-	if got := s.GetStock("B"); got != 5 {
-		t.Errorf("expected product B to remain unchanged at 5, got %d", got)
-	}
-
-	// A batch that should succeed fully.
-	err = s.ReserveMultiple([]ReserveItem{
-		{ProductID: "A", Quantity: 3},
-		{ProductID: "B", Quantity: 2},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got := s.GetStock("A"); got != 7 {
-		t.Errorf("expected product A to be 7, got %d", got)
-	}
-	if got := s.GetStock("B"); got != 3 {
-		t.Errorf("expected product B to be 3, got %d", got)
-	}
+// AddProduct registers a product (or overwrites an existing one with the
+// same ID). It exists mainly to make tests and setup code straightforward;
+// in a real service this would likely be backed by a database instead.
+func (s *SafeInventoryService) AddProduct(p *Product) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.products[p.ID] = p
 }
 
-// TestReserveMultiple_ConcurrentAtomicity hammers ReserveMultiple from many
-// goroutines at once, to prove the all-or-nothing guarantee also holds
-// under real contention, not just in a single-threaded call.
-func TestReserveMultiple_ConcurrentAtomicity(t *testing.T) {
-	s := NewSafeInventoryService()
-	s.AddProduct(&Product{ID: "A", Stock: 50})
-	s.AddProduct(&Product{ID: "B", Stock: 50})
+// GetStock returns the current stock level for a product, or 0 if the
+// product does not exist. Uses RLock so it never blocks other readers.
+func (s *SafeInventoryService) GetStock(productID string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	const goroutines = 100
-	var wg sync.WaitGroup
-	var successCount int64
-
-	wg.Add(goroutines)
-	for i := 0; i < goroutines; i++ {
-		go func() {
-			defer wg.Done()
-			err := s.ReserveMultiple([]ReserveItem{
-				{ProductID: "A", Quantity: 1},
-				{ProductID: "B", Quantity: 1},
-			})
-			if err == nil {
-				atomic.AddInt64(&successCount, 1)
-			}
-		}()
+	product := s.products[productID]
+	if product == nil {
+		return 0
 	}
-	wg.Wait()
-
-	if successCount != 50 {
-		t.Errorf("expected exactly 50 successful batch reservations, got %d", successCount)
-	}
-
-	// A and B must have moved in lockstep - never partially reserved.
-	wantRemaining := int(50 - successCount)
-	if got := s.GetStock("A"); got != wantRemaining {
-		t.Errorf("product A stock mismatch: got %d, want %d", got, wantRemaining)
-	}
-	if got := s.GetStock("B"); got != wantRemaining {
-		t.Errorf("product B stock mismatch: got %d, want %d", got, wantRemaining)
-	}
+	return product.Stock
 }
 
-// TestGetStock_ConcurrentWithReserve exercises readers and writers running
-// at the same time. It doesn't assert exact numbers (the interleaving is
-// non-deterministic by nature) - its purpose is to be run under -race to
-// prove RWMutex usage doesn't allow a data race between GetStock and
-// Reserve.
-func TestGetStock_ConcurrentWithReserve(t *testing.T) {
-	s := NewSafeInventoryService()
-	s.AddProduct(&Product{ID: "p1", Stock: 1000})
+// Reserve atomically checks and decrements stock for a single product.
+// The check and the update happen inside the same critical section, so
+// there is no gap in which another goroutine could interleave and cause an
+// oversell.
+func (s *SafeInventoryService) Reserve(productID string, quantity int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	var wg sync.WaitGroup
-
-	// Writers
-	wg.Add(100)
-	for i := 0; i < 100; i++ {
-		go func() {
-			defer wg.Done()
-			_ = s.Reserve("p1", 1)
-		}()
+	product := s.products[productID]
+	if product == nil {
+		return ErrProductNotFound
+	}
+	if product.Stock < quantity {
+		return ErrInsufficientStock
 	}
 
-	// Readers, running concurrently with the writers above.
-	wg.Add(100)
-	for i := 0; i < 100; i++ {
-		go func() {
-			defer wg.Done()
-			_ = s.GetStock("p1")
-		}()
+	product.Stock -= quantity
+	return nil
+}
+
+// ReserveMultiple reserves several products as a single all-or-nothing
+// operation. It holds the write lock for the entire duration of both the
+// validation pass and the apply pass, so no other goroutine can observe or
+// create an intermediate, partially-reserved state.
+//
+// If any item fails validation (missing product or insufficient stock), no
+// changes are made to any product at all.
+func (s *SafeInventoryService) ReserveMultiple(items []ReserveItem) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Phase 1: validate every item against the current state.
+	for _, item := range items {
+		product := s.products[item.ProductID]
+		if product == nil {
+			return ErrProductNotFound
+		}
+		if product.Stock < item.Quantity {
+			return ErrInsufficientStock
+		}
 	}
 
-	wg.Wait()
-
-	if got := s.GetStock("p1"); got != 900 {
-		t.Errorf("expected 900 remaining, got %d", got)
+	// Phase 2: apply every item. Safe to do without re-checking because we
+	// have held the write lock continuously since phase 1 started - nothing
+	// else could have modified the products in between.
+	for _, item := range items {
+		s.products[item.ProductID].Stock -= item.Quantity
 	}
+
+	return nil
 }
